@@ -5,7 +5,7 @@
 
 import { Disposable, DisposableStore, dispose, IDisposable } from 'vs/base/common/lifecycle';
 import { Event, Emitter } from 'vs/base/common/event';
-import { FileWorkingCopy, IFileWorkingCopy, IFileWorkingCopyModel, IFileWorkingCopyModelFactory } from 'vs/workbench/services/workingCopy/common/fileWorkingCopy';
+import { FileWorkingCopy, IFileWorkingCopy, IFileWorkingCopyModel, IFileWorkingCopyModelFactory, IFileWorkingCopySaveOptions, IResolvedFileWorkingCopy } from 'vs/workbench/services/workingCopy/common/fileWorkingCopy';
 import { SaveReason } from 'vs/workbench/common/editor';
 import { ResourceMap } from 'vs/base/common/map';
 import { ResourceQueue } from 'vs/base/common/async';
@@ -16,6 +16,11 @@ import { VSBufferReadableStream } from 'vs/base/common/buffer';
 import { ILabelService } from 'vs/platform/label/common/label';
 import { IInstantiationService } from 'vs/platform/instantiation/common/instantiation';
 import { ILogService } from 'vs/platform/log/common/log';
+import { IFileDialogService } from 'vs/platform/dialogs/common/dialogs';
+import { isEqual } from 'vs/base/common/resources';
+import { IWorkingCopyFileService } from 'vs/workbench/services/workingCopy/common/workingCopyFileService';
+import { IUriIdentityService } from 'vs/workbench/services/uriIdentity/common/uriIdentity';
+import { CancellationToken } from 'vs/base/common/cancellation';
 
 /**
  * The only one that should be dealing with `IFileWorkingCopy` and handle all
@@ -120,6 +125,14 @@ export interface IFileWorkingCopyResolveOptions {
 	};
 }
 
+export interface IFileWorkingCopySaveAsOptions extends IFileWorkingCopySaveOptions {
+
+	/**
+	 * Optional URI to use as suggested file path to save as.
+	 */
+	suggestedTarget?: URI;
+}
+
 export class FileWorkingCopyManager<T extends IFileWorkingCopyModel> extends Disposable implements IFileWorkingCopyManager<T> {
 
 	//#region Events
@@ -157,12 +170,17 @@ export class FileWorkingCopyManager<T extends IFileWorkingCopyModel> extends Dis
 		@ILifecycleService private readonly lifecycleService: ILifecycleService,
 		@ILabelService private readonly labelService: ILabelService,
 		@IInstantiationService private readonly instantiationService: IInstantiationService,
-		@ILogService private readonly logService: ILogService
+		@ILogService private readonly logService: ILogService,
+		@IFileDialogService private readonly fileDialogService: IFileDialogService,
+		@IWorkingCopyFileService private readonly workingCopyFileService: IWorkingCopyFileService,
+		@IUriIdentityService private readonly uriIdentityService: IUriIdentityService
 	) {
 		super();
 
 		this.registerListeners();
 	}
+
+	//#region Resolve from file changes
 
 	private registerListeners(): void {
 
@@ -206,6 +224,10 @@ export class FileWorkingCopyManager<T extends IFileWorkingCopyModel> extends Dis
 		}
 	}
 
+	//#endregion
+
+	//#region Get / Get all
+
 	get workingCopies(): IFileWorkingCopy<T>[] {
 		return [...this.mapResourceToWorkingCopy.values()];
 	}
@@ -213,6 +235,10 @@ export class FileWorkingCopyManager<T extends IFileWorkingCopyModel> extends Dis
 	get(resource: URI): IFileWorkingCopy<T> | undefined {
 		return this.mapResourceToWorkingCopy.get(resource);
 	}
+
+	//#endregion
+
+	//#region Resolve
 
 	async resolve(resource: URI, options?: IFileWorkingCopyResolveOptions): Promise<IFileWorkingCopy<T>> {
 
@@ -384,6 +410,109 @@ export class FileWorkingCopyManager<T extends IFileWorkingCopyModel> extends Dis
 		this.mapResourceToWorkingCopyListeners.clear();
 	}
 
+	//#endregion
+
+	//#region Save As...
+
+	async saveAs(source: IResolvedFileWorkingCopy<T>, target?: URI, options?: IFileWorkingCopySaveAsOptions): Promise<URI | undefined> {
+
+		// Get to target resource
+		if (!target) {
+			target = await this.fileDialogService.pickFileToSave(options?.suggestedTarget ?? source.resource);
+		}
+
+		if (!target) {
+			return; // user canceled
+		}
+
+		// Just save if target is same as working copies own resource
+		if (isEqual(source.resource, target)) {
+			const saved = await source.save({ ...options, force: true  /* force to save, even if not dirty (https://github.com/microsoft/vscode/issues/99619) */ });
+
+			return saved ? source.resource : undefined;
+		}
+
+		// If the target is different but of same identity, we
+		// move the source to the target, knowing that the
+		// underlying file system cannot have both and then save.
+		// However, this will only work if the source exists
+		// and is not orphaned, so we need to check that too.
+		if (this.uriIdentityService.extUri.isEqual(source.resource, target) && (await this.fileService.exists(source.resource))) {
+
+			// Working copy file takes care of running participants
+			await this.workingCopyFileService.move([{ file: { source: source.resource, target } }]);
+
+			// Save the target
+			return this.doSave(target, options);
+		}
+
+		// Do it
+		return this.doSaveAs(source, target, options);
+	}
+
+	private async doSave(resource: URI, options?: IFileWorkingCopySaveOptions): Promise<URI | undefined> {
+		const workingCopy = this.get(resource);
+		if (!workingCopy) {
+			return undefined;
+		}
+
+		const saved = await workingCopy.save(options);
+
+		return saved ? resource : undefined;
+	}
+
+	private async doSaveAs(sourceWorkingCopy: IResolvedFileWorkingCopy<T>, target: URI, options?: IFileWorkingCopySaveAsOptions): Promise<URI> {
+
+		// Prefer an existing working copy if it is already
+		// resolved for the given target resource
+		let targetExists: boolean = false;
+		let targetWorkingCopy = this.get(target);
+		if (targetWorkingCopy?.isResolved()) {
+			targetExists = true;
+		}
+
+		// Otherwise create the target working copy empty if
+		// it does not exist already and resolve it from there
+		else {
+			targetExists = await this.fileService.exists(target);
+
+			// create target file adhoc if it does not exist yet
+			if (!targetExists) {
+				await this.workingCopyFileService.create([{ resource: target }]);
+			}
+
+			targetWorkingCopy = await this.resolve(target);
+		}
+
+		const sourceModel = sourceWorkingCopy.model;
+
+		let targetModel: T | undefined = undefined;
+		if (targetWorkingCopy.isResolved()) {
+			targetModel = targetWorkingCopy.model;
+		}
+
+		// take over model content from source to target
+		if (sourceModel && targetModel) {
+			const sourceContents = await sourceModel.snapshot(CancellationToken.None);
+
+			await targetModel.update(sourceContents, CancellationToken.None);
+		}
+
+		// save model
+		const success = await targetWorkingCopy.save(options);
+
+		// Revert the source if result is success
+		if (success) {
+			await sourceWorkingCopy.revert();
+		}
+
+		return target;
+	}
+
+	//#endregion
+
+	//#region Lifecycle
+
 	canDispose(workingCopy: IFileWorkingCopy<T>): true | Promise<true> {
 
 		// quick return if working copy already disposed or not dirty and not resolving
@@ -425,4 +554,6 @@ export class FileWorkingCopyManager<T extends IFileWorkingCopyModel> extends Dis
 
 		this.clear();
 	}
+
+	//#endregion
 }
